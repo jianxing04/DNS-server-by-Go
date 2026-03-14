@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s # 压测期间，我们需要高频抓取数据
+
+scrape_configs:
+  - job_name: 'go-dns-relay'
+    static_configs:
+      - targets: ['localhost:2112'] # 你的 Go 程序暴露的 Metrics 端口

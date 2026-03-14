@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,9 @@ import (
 
 	"github.com/coocood/freecache"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sync/singleflight"
@@ -52,6 +56,24 @@ var (
 	cacheWriteQueue chan CacheWriteTask
 	domainStatsMap  sync.Map
 	db              *sql.DB
+	// 【新增】Prometheus 监控指标
+	metricTotalQueries = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dns_queries_total",
+		Help: "收到的 DNS 查询总数",
+	})
+	metricCacheHits = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "dns_cache_hits_total",
+		Help: "缓存命中次数 (包含 L1, L2, Miss)",
+	}, []string{"layer"}) // layer: L1, L2, Miss
+	metricBlockedQueries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "dns_blocked_total",
+		Help: "被安全规则拦截的请求数",
+	}, []string{"reason"}) // reason: ClientIP, Domain, TargetIP
+	metricRequestDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "dns_request_duration_seconds",
+		Help:    "DNS 请求处理延迟分布",
+		Buckets: []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5}, // 从 0.1ms 到 500ms
+	})
 )
 
 // ================= 数据结构 =================
@@ -161,6 +183,15 @@ func initSystem(conn *net.UDPConn) {
 	for i := 0; i < MinWorkers; i++ {
 		spawnWorker(conn)
 	}
+
+	// 启动 Prometheus Metrics 暴露接口 (监听 2112 端口)
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("📊 Prometheus Metrics 接口已启动: http://0.0.0.0:2112/metrics")
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			log.Fatalf("Metrics 启动失败: %v", err)
+		}
+	}()
 }
 
 // asyncStatsFlusher 每隔 10 秒收集一次内存增量，并写入数据库
@@ -330,69 +361,74 @@ func spawnWorker(conn *net.UDPConn) {
 
 // ================= 核心处理：三道防线与中继 =================
 func processRequest(req *Request, conn *net.UDPConn) {
+	// 1. 记录总请求数和处理耗时
+	metricTotalQueries.Inc()
+	startTime := time.Now()
+	defer func() {
+		metricRequestDuration.Observe(time.Since(startTime).Seconds())
+	}()
+
 	defer bufferPool.Put(&req.Data)
 
 	var parser dnsmessage.Parser
 	header, err := parser.Start(req.Data[:req.Length])
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	question, err := parser.Question()
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 
-	// 获取当前生效的安全规则集 (只读，完全无锁)
 	rules := globalRules.Load().(*SecurityRules)
 
-	// ================= 防线 1: 客户端 IP 拦截 =================
+	// ================= 防线 1: 客户端 IP =================
 	clientIP := req.Addr.IP.String()
 	if rules.ClientIPBlocker.Match(clientIP) {
-		// 来源非法，直接丢弃报文不响应，节省带宽
-		return
+		metricBlockedQueries.WithLabelValues("ClientIP").Inc() // 打点
+		return 
 	}
 
-	// ================= 防线 2: 请求域名拦截 =================
+	// ================= 防线 2: 请求域名 =================
 	domainLower := strings.ToLower(question.Name.String())
 	recordDomainAccess(domainLower)
 	if _, exists := rules.DomainBlocker[domainLower]; exists {
-		// 命中恶意域名，直接返回 0.0.0.0
+		metricBlockedQueries.WithLabelValues("Domain").Inc() // 打点
 		sendBlockedResponse(conn, req.Addr, header, question)
 		return
 	}
 
 	cacheKey := fmt.Sprintf("%s_%d", question.Name.String(), question.Type)
-	idHigh := req.Data[0]
-	idLow := req.Data[1]
+	idHigh, idLow := req.Data[0], req.Data[1]
 
-	// 尝试读取 L1 缓存
+	// ================= L1 缓存 =================
 	if cachedRaw, err := localCache.Get([]byte(cacheKey)); err == nil {
+		metricCacheHits.WithLabelValues("L1").Inc() // 打点
 		fastRelay(conn, req.Addr, cachedRaw, idHigh, idLow)
 		return
 	}
 
-	// 尝试读取 L2 缓存
-	ctxRedis, cancelRedis := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancelRedis()
-	redisRaw, err := rdb.Get(ctxRedis, cacheKey).Bytes()
-	if err == nil {
-		fastRelay(conn, req.Addr, redisRaw, idHigh, idLow)
-		cacheWriteQueue <- CacheWriteTask{Key: cacheKey, Raw: redisRaw, TTL: 60 * time.Second}
-		return
-	}
-
-	// 并发竞速回源
+	// ================= 回源与 L2 (无全局锁的完美版) =================
 	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
+		ctxRedis, cancelRedis := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancelRedis()
+		if redisRaw, err := rdb.Get(ctxRedis, cacheKey).Bytes(); err == nil {
+			return redisRaw, nil
+		}
 		return queryUpstreamWithRacing(req.Data[:req.Length])
 	})
 
 	if err == nil {
 		rawResp := result.([]byte)
+		
+		// 判断是谁命中的，用于打点
+		if shared {
+			// 被 Singleflight 拦截共享，算作 L1 (因为是内存态共享)
+			metricCacheHits.WithLabelValues("L1").Inc()
+		} else {
+			// 只有带头大哥去拿了数据，算作 Miss
+			metricCacheHits.WithLabelValues("Miss").Inc()
+		}
 
-		// ================= 防线 3: 目标解析 IP 拦截 =================
-		// 虽然我们是字节流转发，但在第一次拿到上游结果时，我们可以快速解析一次判断其 IP
+		// ================= 防线 3: 目标 IP =================
 		if isTargetIPBlocked(rawResp, rules.TargetIPBlocker) {
-			// 解析出的 IP 是违规的，篡改返回内容为 0.0.0.0 并不要缓存它！
+			metricBlockedQueries.WithLabelValues("TargetIP").Inc() // 打点
 			sendBlockedResponse(conn, req.Addr, header, question)
 			return
 		}
