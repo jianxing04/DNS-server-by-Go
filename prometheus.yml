@@ -1,7 +1,7 @@
 global:
-  scrape_interval: 5s # 压测期间，我们需要高频抓取数据
+  scrape_interval: 5s # 每 5 秒拉取一次数据
 
 scrape_configs:
-  - job_name: 'go-dns-relay'
+  - job_name: 'dns-firewall'
     static_configs:
-      - targets: ['localhost:2112'] # 你的 Go 程序暴露的 Metrics 端口
+      - targets: ['host.docker.internal:2112'] # 指向 Go 程序暴露的端口
