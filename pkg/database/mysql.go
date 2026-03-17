@@ -8,18 +8,19 @@ import (
 	"log"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql" // 必须匿名导入驱动，否则无法 Open
+	_ "github.com/go-sql-driver/mysql" // 必须匿名导入驱动
 )
 
 const (
 	MaxOpenConns = 50
 	MaxIdleConns = 10
 	Username     = "root"
-	Password     = "password"
-	Host         = "localhost"
+	Password     = ""
+	Host         = "127.0.0.1"
 	Port         = 3306
 	DBName       = "dns"
 	Charset      = "utf8mb4"
@@ -27,96 +28,190 @@ const (
 	Loc          = "Local"
 )
 
-var db *sql.DB
+var (
+	db *sql.DB
 
-// InitMySQL 初始化 MySQL 连接池
+	// 🛑 优雅退出控制
+	dbWg         sync.WaitGroup
+	stopDBWorker chan struct{}
+)
+
+// InitMySQL 初始化 MySQL 连接池并启动后台任务
 func InitMySQL() error {
 	var err error
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=%t&loc=%s",
-		Username,
-		Password,
-		Host,
-		Port,
-		DBName,
-		Charset,
-		ParseTime,
-		url.QueryEscape(Loc),
+		Username, Password, Host, Port, DBName, Charset, ParseTime, url.QueryEscape(Loc),
 	)
-	db, err = sql.Open("mysql", dsn)
-	if err != nil {
-		log.Fatalf("MySQL 驱动初始化失败: %v", err)
-		return err
-	}
-	db.SetMaxOpenConns(MaxOpenConns)
-	db.SetMaxIdleConns(MaxIdleConns)
 
-	// 强制进行真实连通性测试，避免程序启动假死
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		log.Fatalf("❌ MySQL 连接失败，请检查服务或密码: %v", err)
-		return err
+	maxRetries := 10
+	for i := range maxRetries {
+		db, err = sql.Open("mysql", dsn)
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = db.PingContext(ctx)
+			cancel()
+			if err == nil {
+				log.Println("✅ MySQL 连接安全建立")
+				db.SetMaxOpenConns(MaxOpenConns)
+				db.SetMaxIdleConns(MaxIdleConns)
+
+				// 初始化退出控制并启动后台任务
+				stopDBWorker = make(chan struct{})
+
+				dbWg.Add(2)
+				go SyncRulesFromMySQL()
+				go AsyncStatsFlusher()
+
+				return nil
+			}
+		}
+		log.Printf("⚠️ MySQL 尚未就绪，等待中... (%d/%d): %v", i+1, maxRetries, err)
+		time.Sleep(2 * time.Second)
 	}
-	log.Println("✅ MySQL 连接安全建立")
-	return nil
+
+	return fmt.Errorf("❌ 达到最大重试次数，MySQL 依然无法连接: %w", err)
+}
+
+// CloseMySQL 优雅关闭 MySQL 模块
+func CloseMySQL() {
+	log.Println("🔄 开始关闭 MySQL 模块...")
+
+	// 1. 发送信号停止后台刷盘和拉取规则的协程
+	if stopDBWorker != nil {
+		close(stopDBWorker)
+	}
+
+	// 2. 阻塞等待后台协程完成最后一次刷盘任务
+	dbWg.Wait()
+	log.Println("✅ MySQL 后台任务已全部安全停止")
+
+	// 3. 关闭数据库连接池
+	if db != nil {
+		err := db.Close()
+		if err != nil {
+			log.Printf("⚠️ MySQL 连接关闭异常: %v\n", err)
+		} else {
+			log.Println("✅ MySQL 连接已关闭")
+		}
+	}
 }
 
 // SyncRulesFromMySQL 定时从数据库拉取启用的规则，并在内存中完成原子替换
 func SyncRulesFromMySQL() {
+	defer dbWg.Done()
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	// 启动时先强制执行一次拉取，避免前 1 分钟没有规则
+	pullRulesFromDB()
+
 	for {
-		newRules := &security.SecurityRules{
-			ClientIPBlocker: security.NewIPBlockTrie(),
-			DomainBlocker:   make(map[string]struct{}),
-			TargetIPBlocker: security.NewIPBlockTrie(),
+		select {
+		case <-stopDBWorker:
+			log.Println("🛑 规则同步任务已停止")
+			return
+		case <-ticker.C:
+			pullRulesFromDB()
 		}
-
-		// 模拟从 MySQL 获取数据 (这里保留你的 mock 数据)
-		mockClientIPs := []string{"192.168.1.0/24"}
-		mockDomains := []string{"ads.google.com.", "badguy.net."}
-		mockTargetIPs := []string{"10.255.255.254/32"}
-
-		for _, cidr := range mockClientIPs {
-			newRules.ClientIPBlocker.Insert(cidr)
-		}
-		for _, cidr := range mockTargetIPs {
-			newRules.TargetIPBlocker.Insert(cidr)
-		}
-		for _, domain := range mockDomains {
-			newRules.DomainBlocker[strings.ToLower(domain)] = struct{}{}
-		}
-
-		// 原子替换
-		security.GlobalRules.Store(newRules)
-		time.Sleep(1 * time.Minute)
 	}
 }
 
-// AsyncStatsFlusher 每隔 10 秒收集一次内存增量，并写入数据库
-// 对于该段时间内未被访问域名，从内存中删除，避免内存爆炸
-func AsyncStatsFlusher() {
-	ticker := time.NewTicker(10 * time.Second)
+// 内部函数：执行真实的 DB 查询和字典树构建
+func pullRulesFromDB() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	for range ticker.C {
-		snapshot := make(map[string]int64)
+	// 只查询已启用的规则
+	query := `SELECT rule_type, rule_value FROM security_rules WHERE is_enabled = 1`
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		log.Printf("⚠️ 拉取安全规则失败: %v", err)
+		return
+	}
+	defer rows.Close()
 
-		DomainStatsMap.Range(func(key, value any) bool {
-			domain := key.(string)
-			countPtr := value.(*int64)
+	// 初始化新的空规则集
+	newRules := &security.SecurityRules{
+		ClientIPBlocker: security.NewIPBlockTrie(),
+		DomainBlocker:   make(map[string]struct{}),
+		TargetIPBlocker: security.NewIPBlockTrie(),
+	}
 
-			delta := atomic.SwapInt64(countPtr, 0)
-			if delta > 0 {
-				snapshot[domain] = delta
-			} else {
-				// 防爆内存：如果 10 秒内无人访问该域名，直接从 Map 删除。
-				// 防止遭遇随机子域名攻击(PRSD)导致内存溢出。
-				DomainStatsMap.Delete(key)
-			}
-			return true
-		})
+	var ruleType, ruleValue string
+	count := 0
 
-		if len(snapshot) > 0 {
-			FlushToMySQL(snapshot)
+	for rows.Next() {
+		if err := rows.Scan(&ruleType, &ruleValue); err != nil {
+			log.Printf("⚠️ 解析安全规则数据行失败: %v", err)
+			continue
 		}
+
+		switch ruleType {
+		case "client_ip":
+			if err := newRules.ClientIPBlocker.Insert(ruleValue); err != nil {
+				log.Printf("⚠️ 无效的客户端 IP 规则 [%s]: %v", ruleValue, err)
+			}
+		case "target_ip":
+			if err := newRules.TargetIPBlocker.Insert(ruleValue); err != nil {
+				log.Printf("⚠️ 无效的目标 IP 规则 [%s]: %v", ruleValue, err)
+			}
+		case "domain":
+			newRules.DomainBlocker[strings.ToLower(ruleValue)] = struct{}{}
+		}
+		count++
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("⚠️ 读取规则行遍历时发生错误: %v", err)
+		return
+	}
+
+	// 原子替换，零停机更新规则！
+	security.GlobalRules.Store(newRules)
+	log.Printf("🛡️ 成功从 MySQL 同步并加载 %d 条安全规则", count)
+}
+
+// AsyncStatsFlusher 每隔 10 秒收集一次内存增量，并写入数据库
+func AsyncStatsFlusher() {
+	defer dbWg.Done()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopDBWorker:
+			// 【核心优化】：收到退出信号时，触发“遗言”操作，执行最后一次全量 Flush
+			log.Println("🛑 收到退出信号，准备执行最后一次统计数据刷盘...")
+			doFlush()
+			return
+		case <-ticker.C:
+			doFlush()
+		}
+	}
+}
+
+// 内部函数：执行一次遍历和刷盘
+func doFlush() {
+	snapshot := make(map[string]int64)
+
+	DomainStatsMap.Range(func(key, value any) bool {
+		domain := key.(string)
+		countPtr := value.(*int64)
+
+		delta := atomic.SwapInt64(countPtr, 0)
+		if delta > 0 {
+			snapshot[domain] = delta
+		} else {
+			// 防爆内存：如果一段时间内无人访问该域名，直接从 Map 删除
+			DomainStatsMap.Delete(key)
+		}
+		return true
+	})
+
+	if len(snapshot) > 0 {
+		FlushToMySQL(snapshot)
 	}
 }
 
@@ -126,7 +221,7 @@ func FlushToMySQL(snapshot map[string]int64) {
 		return
 	}
 
-	const batchSize = 1000 // 【优化】每次最多插入 1000 条，防止超长 SQL 被 MySQL 拒绝
+	const batchSize = 1000
 	now := time.Now()
 	statDate := now.Format("2006-01-02")
 	statHour := now.Hour()
@@ -143,21 +238,19 @@ func FlushToMySQL(snapshot map[string]int64) {
 		count++
 		totalProcessed++
 
-		// 达到批次上限，执行一次入库
 		if count >= batchSize {
 			executeBatch(placeholders, vals)
-			placeholders = placeholders[:0] // 清空切片复用内存
+			placeholders = placeholders[:0]
 			vals = vals[:0]
 			count = 0
 		}
 	}
 
-	// 处理剩余尾部数据
 	if count > 0 {
 		executeBatch(placeholders, vals)
 	}
 
-	log.Printf("📈 成功将 %d 个域名的增量访问数据合并刷入 MySQL！", totalProcessed)
+	// log.Printf("📈 成功将 %d 个域名的增量访问数据合并刷入 MySQL！", totalProcessed)
 }
 
 // executeBatch 内部函数，执行真正的单批次 SQL 写入
