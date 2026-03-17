@@ -21,14 +21,13 @@ const (
 func main() {
 	addr, _ := net.ResolveUDPAddr("udp", ListenAddr)
 	conn, _ := net.ListenUDP("udp", addr)
-	// 移除了 defer conn.Close()，因为我们要在收到信号后手动控制关闭顺序
 
 	if err := InitSystem(conn); err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 	log.Printf("🚀 DNS 防火墙启动 (三级安全引擎已挂载)，监听 %s", ListenAddr)
 
-	// 1. 将原先的死循环放入独立的后台协程中
+	// 启动监听协程
 	go func() {
 		for {
 			bufPtr := handle.GetFromPool()
@@ -42,7 +41,7 @@ func main() {
 		}
 	}()
 
-	// 2. 优雅退出 (Graceful Shutdown) 机制
+	// 优雅退出 (Graceful Shutdown) 机制
 	// 拦截 Ctrl+C (SIGINT) 和 Docker Stop (SIGTERM)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -53,38 +52,31 @@ func main() {
 	log.Println("🛑 接收到退出信号，正在执行优雅关闭...")
 
 	// 3. 安全关闭顺序
-	conn.Close()     // 停止接收新的 UDP 请求
-	database.Close() // 关闭 Redis 连接
-
-	// 注意：在更极端的生产环境中，我们还会在这里主动调用一次 MySQL Flush
-	// 把内存中最后几秒的数据强行刷入数据库再退出。
+	conn.Close()          // 停止接收新的 UDP 请求
+	database.CloseCache() // 关闭所有缓存相关的协程和连接
+	database.CloseMySQL() // 关闭 MySQL 连接池
 
 	log.Println("👋 DNS 防火墙已安全退出")
 }
 
 func InitSystem(conn *net.UDPConn) error {
-	// 1. 初始化空规则
+	// 初始化空规则
 	security.InitEmptyGlobalRules()
 
-	// 2. 初始化 MySQL
+	// 初始化 MySQL
 	if err := database.InitMySQL(); err != nil {
-		return err // 使用 return 交给 main 函数去 Fatal
-	}
-	go database.SyncRulesFromMySQL()
-	go database.AsyncStatsFlusher()
-
-	// 3. 初始化 Redis
-	if err := database.InitRedis(); err != nil {
 		return err
 	}
 
-	// 4. 初始化内存缓存与异步写入队列
-	database.InitCache()
+	// 初始化内存缓存,redis与异步写入队列
+	if err := database.InitCache(); err != nil {
+		return err
+	}
 
-	// 5. 初始化工作池
+	// 初始化工作池
 	handle.InitWorkerPool(conn)
 
-	// 6. 启动监控指标
+	// 启动监控指标
 	metrics.StartServer(":2112")
 	return nil
 }
