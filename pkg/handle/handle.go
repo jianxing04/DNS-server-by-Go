@@ -1,6 +1,7 @@
 package handle
 
 import (
+	"DNS-server-by-Go/pkg/config"
 	"DNS-server-by-Go/pkg/database"
 	"DNS-server-by-Go/pkg/metrics"
 	"DNS-server-by-Go/pkg/security"
@@ -18,46 +19,43 @@ import (
 
 const (
 	MaxDNSPacketSize = 512
-	JobQueueSize     = 10_000
-	MinWorkers       = 5
-	MaxWorkers       = 100_000
-	IdleTimeout      = 10 * time.Minute
 )
 
 var (
 	jobQueue      chan *Request
 	activeWorkers int32
-	bufferPool    = sync.Pool{
-		New: func() any { buf := make([]byte, MaxDNSPacketSize); return &buf },
+	workerCfg     config.WorkerConfig
+
+	bufferPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, MaxDNSPacketSize)
+			return &buf
+		},
 	}
 
-	// 🔪 【核心优化 2】：Socket 对象池，彻底消灭 DialUDP 系统调用
 	socketPool = sync.Pool{
 		New: func() any {
-			// 预先监听一个随机本地端口，常驻内存复用
-			conn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+			if err != nil {
+				panic(fmt.Sprintf("创建 UDPConn 失败：%v", err))
+			}
 			return conn
 		},
 	}
 
-	upstreamList = []string{
-		//"127.0.0.1:8079", // Mock 上游
-		"114.114.114.114:53",
-		"8.8.8.8:53",
-		"1.1.1.1:53",
-		"223.5.5.5:53",
-	}
-	upstreamAddrs []*net.UDPAddr
-	requestGroup  singleflight.Group
+	upstreamAddrs   []*net.UDPAddr
+	upstreamTimeout time.Duration
+	requestGroup    singleflight.Group
 )
 
-// ================= 初始化与预处理 =================
-func init() {
-	for _, addr := range upstreamList {
+func SetUpstreams(servers []string, timeout time.Duration) {
+	upstreamAddrs = nil
+	for _, addr := range servers {
 		if u, err := net.ResolveUDPAddr("udp", addr); err == nil {
 			upstreamAddrs = append(upstreamAddrs, u)
 		}
 	}
+	upstreamTimeout = timeout
 }
 
 // ================= 并发竞速模型与底层响应 =================
@@ -72,9 +70,10 @@ type Request struct {
 	Addr   *net.UDPAddr
 }
 
-func InitWorkerPool(conn *net.UDPConn) {
-	jobQueue = make(chan *Request, JobQueueSize)
-	for i := 0; i < MinWorkers; i++ {
+func InitWorkerPool(conn *net.UDPConn, cfg config.WorkerConfig) {
+	workerCfg = cfg
+	jobQueue = make(chan *Request, cfg.JobQueueSize)
+	for i := 0; i < cfg.MinWorkers; i++ {
 		spawnWorker(conn)
 	}
 }
@@ -87,16 +86,13 @@ func PutToPool(buf *[]byte) {
 	bufferPool.Put(buf)
 }
 
-// 🔪 【核心优化 1】：完全非阻塞的主干道分发器
 func DispatchRequest(req *Request, conn *net.UDPConn) {
 	select {
 	case jobQueue <- req:
 	default:
-		// 队列满了，尝试扩容
-		if atomic.LoadInt32(&activeWorkers) < MaxWorkers {
+		if atomic.LoadInt32(&activeWorkers) < int32(workerCfg.MaxWorkers) {
 			spawnWorker(conn)
 		}
-		// 扩容后，再次【非阻塞】尝试入队。如果还是满的，果断丢包保全主协程！
 		select {
 		case jobQueue <- req:
 		default:
@@ -111,7 +107,8 @@ func spawnWorker(conn *net.UDPConn) {
 	go func() {
 		defer atomic.AddInt32(&activeWorkers, -1)
 
-		idleTimer := time.NewTimer(IdleTimeout)
+		idleTimeout := workerCfg.IdleTimeoutDuration()
+		idleTimer := time.NewTimer(idleTimeout)
 		defer idleTimer.Stop()
 
 		for {
@@ -125,13 +122,13 @@ func spawnWorker(conn *net.UDPConn) {
 					default:
 					}
 				}
-				idleTimer.Reset(IdleTimeout)
+				idleTimer.Reset(idleTimeout)
 
 			case <-idleTimer.C:
-				if atomic.LoadInt32(&activeWorkers) > MinWorkers {
+				if atomic.LoadInt32(&activeWorkers) > int32(workerCfg.MinWorkers) {
 					return
 				}
-				idleTimer.Reset(IdleTimeout)
+				idleTimer.Reset(idleTimeout)
 			}
 		}
 	}()
@@ -182,7 +179,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		return
 	}
 
-	result, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
+	result, err, shared := requestGroup.Do(cacheKey, func() (any, error) {
 		ctxRedis, cancelRedis := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancelRedis()
 		if redisRaw, err := database.GetRedis(ctxRedis, cacheKey); err == nil {
@@ -218,7 +215,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 }
 
 func queryUpstreamWithRacing(reqData []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
 	defer cancel()
 	resCh := make(chan racingResult, len(upstreamAddrs))
 

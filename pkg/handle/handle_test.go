@@ -1,6 +1,7 @@
 package handle
 
 import (
+	"DNS-server-by-Go/pkg/config"
 	"context"
 	"net"
 	"testing"
@@ -85,6 +86,7 @@ func TestQueryUpstreamWithRacing(t *testing.T) {
 	u1, _ := net.ResolveUDPAddr("udp", addr1)
 	u2, _ := net.ResolveUDPAddr("udp", addr2)
 	upstreamAddrs = []*net.UDPAddr{u1, u2}
+	upstreamTimeout = 200 * time.Millisecond
 
 	// 3. 构造请求包
 	reqData := buildMockDNSQuery("example.com.")
@@ -113,7 +115,12 @@ func BenchmarkWorkerPoolDispatch(b *testing.B) {
 	req := &Request{Data: make([]byte, 50), Length: 50, Addr: dummyAddr}
 
 	// 初始化工组池 (不传 conn 因为我们不真实回包)
-	InitWorkerPool(nil)
+	InitWorkerPool(nil, config.WorkerConfig{
+		JobQueueSize: 10000,
+		MinWorkers:   5,
+		MaxWorkers:   100000,
+		IdleTimeout:  "10m",
+	})
 
 	b.ResetTimer() // 重置计时器，排除初始化时间的干扰
 
@@ -155,6 +162,7 @@ func BenchmarkQueryUpstreamWithRacing(b *testing.B) {
 	u1, _ := net.ResolveUDPAddr("udp", addr1)
 	u2, _ := net.ResolveUDPAddr("udp", addr2)
 	upstreamAddrs = []*net.UDPAddr{u1, u2}
+	upstreamTimeout = 200 * time.Millisecond
 
 	reqData := buildMockDNSQuery("racing.com.")
 
