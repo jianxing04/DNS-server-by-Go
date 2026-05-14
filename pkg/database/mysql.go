@@ -1,47 +1,32 @@
 package database
 
 import (
+	"DNS-server-by-Go/pkg/config"
 	"DNS-server-by-Go/pkg/security"
 	"context"
 	"database/sql"
 	"fmt"
 	"log"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql" // 必须匿名导入驱动
-)
-
-const (
-	MaxOpenConns = 50
-	MaxIdleConns = 10
-	Username     = "root"
-	Password     = ""
-	Host         = "127.0.0.1"
-	Port         = 3306
-	DBName       = "dns"
-	Charset      = "utf8mb4"
-	ParseTime    = true
-	Loc          = "Local"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 var (
-	db *sql.DB
-
-	// 🛑 优雅退出控制
+	db           *sql.DB
+	mysqlCfg     config.MySQLConfig
 	dbWg         sync.WaitGroup
 	stopDBWorker chan struct{}
 )
 
-// InitMySQL 初始化 MySQL 连接池并启动后台任务
-func InitMySQL() error {
+func InitMySQL(cfg config.MySQLConfig) error {
+	mysqlCfg = cfg
+
 	var err error
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=%t&loc=%s",
-		Username, Password, Host, Port, DBName, Charset, ParseTime, url.QueryEscape(Loc),
-	)
+	dsn := cfg.DSN()
 
 	maxRetries := 10
 	for i := range maxRetries {
@@ -52,10 +37,9 @@ func InitMySQL() error {
 			cancel()
 			if err == nil {
 				log.Println("✅ MySQL 连接安全建立")
-				db.SetMaxOpenConns(MaxOpenConns)
-				db.SetMaxIdleConns(MaxIdleConns)
+				db.SetMaxOpenConns(cfg.MaxOpenConns)
+				db.SetMaxIdleConns(cfg.MaxIdleConns)
 
-				// 初始化退出控制并启动后台任务
 				stopDBWorker = make(chan struct{})
 
 				dbWg.Add(2)
@@ -100,10 +84,9 @@ func CloseMySQL() {
 func SyncRulesFromMySQL() {
 	defer dbWg.Done()
 
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(mysqlCfg.RuleSyncDuration())
 	defer ticker.Stop()
 
-	// 启动时先强制执行一次拉取，避免前 1 分钟没有规则
 	pullRulesFromDB()
 
 	for {
@@ -176,13 +159,12 @@ func pullRulesFromDB() {
 func AsyncStatsFlusher() {
 	defer dbWg.Done()
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(mysqlCfg.StatsFlushDuration())
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-stopDBWorker:
-			// 【核心优化】：收到退出信号时，触发“遗言”操作，执行最后一次全量 Flush
 			log.Println("🛑 收到退出信号，准备执行最后一次统计数据刷盘...")
 			doFlush()
 			return

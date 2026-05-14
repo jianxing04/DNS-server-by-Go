@@ -1,0 +1,56 @@
+# ===========================================
+# DNS 防火墙 - 测试版配置文件
+# 使用 Mock 上游 DNS + 本地 Docker 的 MySQL/Redis
+# 启动方式: ./dns-firewall -config config.dev.yaml
+# ===========================================
+
+server:
+  listen: "0.0.0.0:8053"
+  metrics_addr: ":2112"
+
+# 测试版：使用 Mock 上游 DNS 服务器
+upstream:
+  servers:
+    - "127.0.0.1:8079"
+  timeout: "200ms"
+
+# 测试版：连接本地 Docker 中的 MySQL
+mysql:
+  host: "127.0.0.1"
+  port: 3307
+  user: "root"
+  password: "password"
+  database: "dns"
+  charset: "utf8mb4"
+  max_open_conns: 50
+  max_idle_conns: 10
+  rule_sync_interval: "1m"
+  stats_flush_interval: "10s"
+
+# 测试版：连接本地 Docker 中的 Redis
+redis:
+  addr: "localhost:6380"
+  password: ""
+  db: 0
+  pool_size: 500
+  min_idle_conns: 50
+  dial_timeout: "5s"
+  read_timeout: "1s"
+  write_timeout: "1s"
+  pool_timeout: "2s"
+
+# 缓存配置
+cache:
+  local_cache_size: 104857600   # 100MB
+  write_queue_size: 50000
+  min_workers: 10
+  max_workers: 1000
+  scale_up_threshold: 1000
+  scale_down_idle: "30s"
+
+# Worker 协程池配置
+worker:
+  job_queue_size: 10000
+  min_workers: 5
+  max_workers: 100000
+  idle_timeout: "10m"

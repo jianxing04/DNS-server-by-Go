@@ -1,6 +1,7 @@
 package database
 
 import (
+	"DNS-server-by-Go/pkg/config"
 	"context"
 	"fmt"
 	"log"
@@ -12,28 +13,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	CacheSize      = 100 * 1024 * 1024 // 100MB
-	WriteQueueSize = 50_000
-
-	// 弹性调度参数
-	MinCacheWorkers   = 10               // 低谷期保留的最少协程数
-	MaxCacheWorkers   = 1000             // 高峰期允许的最大协程数
-	ScaleUpThreshold  = 1000             // 队列长度超过此值时触发扩容
-	ScaleDownIdleTime = 30 * time.Second // 协程空闲多久后自动销毁
-
-	// Redis 配置
-	RedisAddr     = "localhost:6379"
-	RedisPassword = ""
-	RedisDB       = 0
-	PoolSize      = 500
-	MinIdleConns  = 50
-	DialTimeout   = 5 * time.Second
-	ReadTimeout   = 1 * time.Second
-	WriteTimeout  = 1 * time.Second
-	PoolTimeout   = 2 * time.Second
-)
-
 var (
 	DomainStatsMap  sync.Map
 	CacheWriteQueue chan CacheWriteTask
@@ -42,18 +21,17 @@ var (
 	rdb *redis.Client
 	ctx = context.Background()
 
-	// 📊 命中率统计指标
 	hitL1   int64
 	hitL2   int64
 	hitMiss int64
 
-	// 📈 弹性调度与可观测性指标
-	activeWorkers atomic.Int32 // 当前活跃的写入协程数量
-	droppedTasks  atomic.Int64 // 队列满导致的丢弃数量
+	activeWorkers atomic.Int32
+	droppedTasks  atomic.Int64
 
-	// 🛑 优雅退出控制
 	wg          sync.WaitGroup
 	stopMonitor chan struct{}
+
+	cacheCfg config.CacheConfig
 )
 
 type CacheWriteTask struct {
@@ -62,34 +40,32 @@ type CacheWriteTask struct {
 	TTL time.Duration
 }
 
-// InitCache 初始化缓存，连接 Redis，并启动弹性调度器
-func InitCache() error {
-	LocalCache = freecache.NewCache(CacheSize)
-	CacheWriteQueue = make(chan CacheWriteTask, WriteQueueSize)
+func InitCache(redisCfg config.RedisConfig, cfg config.CacheConfig) error {
+	cacheCfg = cfg
+
+	LocalCache = freecache.NewCache(cfg.LocalCacheSize)
+	CacheWriteQueue = make(chan CacheWriteTask, cfg.WriteQueueSize)
 	stopMonitor = make(chan struct{})
 
-	// 1. 启动最小数量的基础写入协程 (底薪员工)
-	for range MinCacheWorkers {
+	for range cfg.MinWorkers {
 		wg.Add(1)
 		activeWorkers.Add(1)
 		go asyncRedisWriter()
 	}
 
-	// 2. 启动动态调度器和命中率监控
 	go workerManager()
 	go startHitRateMonitor()
 
-	// 3. 初始化 Redis 客户端
 	rdb = redis.NewClient(&redis.Options{
-		Addr:         RedisAddr,
-		Password:     RedisPassword,
-		DB:           RedisDB,
-		PoolSize:     PoolSize,
-		MinIdleConns: MinIdleConns,
-		DialTimeout:  DialTimeout,
-		ReadTimeout:  ReadTimeout,
-		WriteTimeout: WriteTimeout,
-		PoolTimeout:  PoolTimeout,
+		Addr:         redisCfg.Addr,
+		Password:     redisCfg.Password,
+		DB:           redisCfg.DB,
+		PoolSize:     redisCfg.PoolSize,
+		MinIdleConns: redisCfg.MinIdleConns,
+		DialTimeout:  redisCfg.DialTimeoutDuration(),
+		ReadTimeout:  redisCfg.ReadTimeoutDuration(),
+		WriteTimeout: redisCfg.WriteTimeoutDuration(),
+		PoolTimeout:  redisCfg.PoolTimeoutDuration(),
 	})
 
 	var err error
@@ -186,17 +162,16 @@ func asyncRedisWriter() {
 	defer wg.Done()
 	defer activeWorkers.Add(-1)
 
-	idleTimer := time.NewTimer(ScaleDownIdleTime)
+	idleTimer := time.NewTimer(cacheCfg.ScaleDownIdleDuration())
 	defer idleTimer.Stop()
 
 	for {
 		select {
 		case task, ok := <-CacheWriteQueue:
 			if !ok {
-				return // 队列已关闭，优雅退出
+				return
 			}
 
-			// 停止定时器并清空通道，准备复用
 			if !idleTimer.Stop() {
 				select {
 				case <-idleTimer.C:
@@ -209,18 +184,15 @@ func asyncRedisWriter() {
 			cancel()
 
 			if err != nil {
-				// 压测下屏蔽 Redis 错误日志，避免大量 I/O 拖垮 QPS
 			}
 
-			// 重置空闲倒计时
-			idleTimer.Reset(ScaleDownIdleTime)
+			idleTimer.Reset(cacheCfg.ScaleDownIdleDuration())
 
 		case <-idleTimer.C:
-			// 触发空闲超时，判断是否需要“裁员”
-			if activeWorkers.Load() > int32(MinCacheWorkers) {
-				return // 留下足够的基础协程，当前协程功成身退
+			if activeWorkers.Load() > int32(cacheCfg.MinWorkers) {
+				return
 			}
-			idleTimer.Reset(ScaleDownIdleTime)
+			idleTimer.Reset(cacheCfg.ScaleDownIdleDuration())
 		}
 	}
 }
@@ -239,11 +211,10 @@ func workerManager() {
 			qLen := len(CacheWriteQueue)
 			currentWorkers := activeWorkers.Load()
 
-			// 如果队列积压超过阈值，且还没达到协程上限，则按批次扩容
-			if qLen > ScaleUpThreshold && currentWorkers < MaxCacheWorkers {
+			if qLen > cacheCfg.ScaleUpThreshold && currentWorkers < int32(cacheCfg.MaxWorkers) {
 				batchSize := int32(20)
-				if currentWorkers+batchSize > MaxCacheWorkers {
-					batchSize = MaxCacheWorkers - currentWorkers
+				if currentWorkers+batchSize > int32(cacheCfg.MaxWorkers) {
+					batchSize = int32(cacheCfg.MaxWorkers) - currentWorkers
 				}
 
 				for i := int32(0); i < batchSize; i++ {
