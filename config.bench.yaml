@@ -1,29 +1,21 @@
-# ===========================================
-# DNS 防火墙 - 发行版配置文件
-# 客户部署时请根据实际环境修改以下配置项
-# 启动方式: ./dns-firewall -config config.yaml
-# ===========================================
-
 server:
   listen: "0.0.0.0:8053"
   metrics_addr: ":2112"
   socket_pool_size: 1000
 
-# 发行版：配置真实的上游 DNS 服务器
 upstream:
   servers:
     - "114.114.114.114:53"
     - "8.8.8.8:53"
-    - "1.1.1.1:53"
     - "223.5.5.5:53"
+    - "1.1.1.1:53"
   timeout: "200ms"
 
-# 发行版：客户自行配置 MySQL 连接信息
 mysql:
   host: "127.0.0.1"
   port: 3306
-  user: "dns_user"
-  password: "请修改为实际密码"
+  user: "root"
+  password: ""
   database: "dns"
   charset: "utf8mb4"
   max_open_conns: 50
@@ -31,7 +23,6 @@ mysql:
   rule_sync_interval: "1m"
   stats_flush_interval: "10s"
 
-# 发行版：客户自行配置 Redis 连接信息
 redis:
   addr: "127.0.0.1:6379"
   password: ""
@@ -43,16 +34,14 @@ redis:
   write_timeout: "1s"
   pool_timeout: "2s"
 
-# 缓存配置
 cache:
-  local_cache_size: 104857600   # 100MB
+  local_cache_size: 104857600
   write_queue_size: 50000
   min_workers: 10
   max_workers: 1000
   scale_up_threshold: 1000
   scale_down_idle: "30s"
 
-# Worker 协程池配置
 worker:
   job_queue_size: 10000
   min_workers: 5

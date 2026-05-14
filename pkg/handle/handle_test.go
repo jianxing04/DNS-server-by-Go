@@ -2,7 +2,6 @@ package handle
 
 import (
 	"DNS-server-by-Go/pkg/config"
-	"context"
 	"net"
 	"testing"
 	"time"
@@ -134,18 +133,17 @@ func BenchmarkWorkerPoolDispatch(b *testing.B) {
 
 // 压测单节点回源性能 (querySingleUpstream)
 func BenchmarkQuerySingleUpstream(b *testing.B) {
+	InitSocketPool(100)
 	mockConn, addr := startMockDNSServer(b)
 	defer mockConn.Close()
 	targetAddr, _ := net.ResolveUDPAddr("udp", addr)
 
 	reqData := buildMockDNSQuery("speedtest.com.")
-	ctx := context.Background()
 
 	b.ResetTimer()
 
-	// 串行压测，测试建立连接、发送、等待响应、解析的一套极速流程
 	for i := 0; i < b.N; i++ {
-		_, err := querySingleUpstream(ctx, targetAddr, reqData)
+		_, err := querySingleUpstream(time.Now().Add(200*time.Millisecond), targetAddr, reqData)
 		if err != nil {
 			b.Fatalf("回源压测失败: %v", err)
 		}

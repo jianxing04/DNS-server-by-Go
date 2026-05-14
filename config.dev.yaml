@@ -7,6 +7,7 @@
 server:
   listen: "0.0.0.0:8053"
   metrics_addr: ":2112"
+  socket_pool_size: 1000
 
 # 测试版：使用 Mock 上游 DNS 服务器
 upstream:

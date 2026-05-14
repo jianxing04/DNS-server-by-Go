@@ -33,20 +33,56 @@ var (
 		},
 	}
 
-	socketPool = sync.Pool{
-		New: func() any {
-			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-			if err != nil {
-				panic(fmt.Sprintf("创建 UDPConn 失败：%v", err))
-			}
-			return conn
-		},
-	}
+	socketPool     chan *net.UDPConn
+	socketPoolSize int
 
 	upstreamAddrs   []*net.UDPAddr
 	upstreamTimeout time.Duration
 	requestGroup    singleflight.Group
 )
+
+func InitSocketPool(size int) {
+	socketPoolSize = size
+	socketPool = make(chan *net.UDPConn, size)
+	for i := 0; i < size/2; i++ {
+		conn, err := createSocket()
+		if err != nil {
+			panic(fmt.Sprintf("预创建 Socket 失败: %v", err))
+		}
+		socketPool <- conn
+	}
+}
+
+func createSocket() (*net.UDPConn, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, err
+	}
+	conn.SetReadBuffer(4096)
+	conn.SetWriteBuffer(4096)
+	return conn, nil
+}
+
+func getSocket() *net.UDPConn {
+	select {
+	case conn := <-socketPool:
+		return conn
+	default:
+		conn, err := createSocket()
+		if err != nil {
+			return nil
+		}
+		return conn
+	}
+}
+
+func putSocket(conn *net.UDPConn) {
+	select {
+	case socketPool <- conn:
+	default:
+		conn.Close()
+	}
+}
 
 func SetUpstreams(servers []string, timeout time.Duration) {
 	upstreamAddrs = nil
@@ -215,16 +251,18 @@ func processRequest(req *Request, conn *net.UDPConn) {
 }
 
 func queryUpstreamWithRacing(reqData []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
-	defer cancel()
+	deadline := time.Now().Add(upstreamTimeout)
 	resCh := make(chan racingResult, len(upstreamAddrs))
 
 	for _, targetAddr := range upstreamAddrs {
 		go func(target *net.UDPAddr) {
-			raw, err := querySingleUpstream(ctx, target, reqData)
+			raw, err := querySingleUpstream(deadline, target, reqData)
 			resCh <- racingResult{raw, err}
 		}(targetAddr)
 	}
+
+	timer := time.NewTimer(upstreamTimeout)
+	defer timer.Stop()
 
 	var lastErr error
 	for i := 0; i < len(upstreamAddrs); i++ {
@@ -234,19 +272,20 @@ func queryUpstreamWithRacing(reqData []byte) ([]byte, error) {
 				return res.raw, nil
 			}
 			lastErr = res.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-timer.C:
+			return nil, fmt.Errorf("upstream timeout")
 		}
 	}
 	return nil, lastErr
 }
 
-func querySingleUpstream(ctx context.Context, targetAddr *net.UDPAddr, reqData []byte) ([]byte, error) {
-	// 🔪 使用池化 Socket 发送请求
-	uConn := socketPool.Get().(*net.UDPConn)
-	defer socketPool.Put(uConn) // 用完务必还回去
+func querySingleUpstream(deadline time.Time, targetAddr *net.UDPAddr, reqData []byte) ([]byte, error) {
+	uConn := getSocket()
+	if uConn == nil {
+		return nil, fmt.Errorf("获取 Socket 失败")
+	}
+	defer putSocket(uConn)
 
-	deadline, _ := ctx.Deadline()
 	uConn.SetDeadline(deadline)
 
 	_, err := uConn.WriteToUDP(reqData, targetAddr)
@@ -254,7 +293,6 @@ func querySingleUpstream(ctx context.Context, targetAddr *net.UDPAddr, reqData [
 		return nil, err
 	}
 
-	// 🔪 复用内存池接收响应，减少 GC
 	respData := GetFromPool()
 	defer PutToPool(respData)
 
@@ -269,7 +307,6 @@ func querySingleUpstream(ctx context.Context, targetAddr *net.UDPAddr, reqData [
 		return nil, fmt.Errorf("invalid response")
 	}
 
-	// 拷贝一份数据返回，因为 respData 马上要归还给 Pool
 	finalResp := make([]byte, n)
 	copy(finalResp, (*respData)[:n])
 	return finalResp, nil

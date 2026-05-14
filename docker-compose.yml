@@ -25,6 +25,10 @@ services:
       - redis-server
     ports:
       - "2112:2112"
+    sysctls:
+      - net.core.rmem_max=26214400
+      - net.core.wmem_max=26214400
+      - net.ipv4.udp_mem=10240 87380 16777216
 
   # 计算层 (DNS 节点 2)
   dns-node-2:
@@ -34,6 +38,10 @@ services:
       - redis-server
     ports:
       - "2113:2112"
+    sysctls:
+      - net.core.rmem_max=26214400
+      - net.core.wmem_max=26214400
+      - net.ipv4.udp_mem=10240 87380 16777216
 
   # 计算层 (DNS 节点 3)
   dns-node-3:
@@ -43,6 +51,10 @@ services:
       - redis-server
     ports:
       - "2114:2112"
+    sysctls:
+      - net.core.rmem_max=26214400
+      - net.core.wmem_max=26214400
+      - net.ipv4.udp_mem=10240 87380 16777216
 
   # 4. 接入层 (Nginx UDP 负载均衡)
   nginx-lb:

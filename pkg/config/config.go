@@ -18,8 +18,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen      string `yaml:"listen"`
-	MetricsAddr string `yaml:"metrics_addr"`
+	Listen         string `yaml:"listen"`
+	MetricsAddr    string `yaml:"metrics_addr"`
+	SocketPoolSize int    `yaml:"socket_pool_size"`
 }
 
 type UpstreamConfig struct {
@@ -166,6 +167,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Server.MetricsAddr == "" {
 		cfg.Server.MetricsAddr = ":2112"
+	}
+	if cfg.Server.SocketPoolSize == 0 {
+		cfg.Server.SocketPoolSize = 1000
 	}
 	if cfg.Upstream.Timeout == "" {
 		cfg.Upstream.Timeout = "200ms"
