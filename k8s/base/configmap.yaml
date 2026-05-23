@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dns-firewall-config
+  namespace: dns-firewall
+data:
+  config.yaml: |
+    server:
+      listen: "0.0.0.0:8053"
+      metrics_addr: ":2112"
+      socket_pool_size: 1000
+
+    upstream:
+      servers:
+        - "114.114.114.114:53"
+        - "8.8.8.8:53"
+        - "223.5.5.5:53"
+        - "1.1.1.1:53"
+      timeout: "200ms"
+
+    mysql:
+      host: "mysql.dns-firewall.svc.cluster.local"
+      port: 3306
+      user: "dns_user"
+      password: ""
+      database: "dns"
+      charset: "utf8mb4"
+      max_open_conns: 50
+      max_idle_conns: 10
+      rule_sync_interval: "1m"
+      stats_flush_interval: "10s"
+
+    redis:
+      addr: "redis.dns-firewall.svc.cluster.local:6379"
+      password: ""
+      db: 0
+      pool_size: 500
+      min_idle_conns: 50
+      dial_timeout: "5s"
+      read_timeout: "1s"
+      write_timeout: "1s"
+      pool_timeout: "2s"
+
+    cache:
+      local_cache_size: 104857600
+      write_queue_size: 50000
+      min_workers: 10
+      max_workers: 1000
+      scale_up_threshold: 1000
+      scale_down_idle: "30s"
+
+    worker:
+      job_queue_size: 10000
+      min_workers: 5
+      max_workers: 100000
+      idle_timeout: "10m"

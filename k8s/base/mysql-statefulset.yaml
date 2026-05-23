@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: dns-firewall
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args:
+            - --default-authentication-plugin=mysql_native_password
+            - --max_connections=1000
+            - --innodb_buffer_pool_size=256M
+            - --innodb_flush_log_at_trx_commit=2
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dns-firewall-secret
+                  key: mysql-root-password
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: dns-firewall-secret
+                  key: mysql-user
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dns-firewall-secret
+                  key: mysql-password
+          ports:
+            - containerPort: 3306
+              name: mysql
+              protocol: TCP
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - localhost
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - mysql
+                - -h
+                - localhost
+                - -e
+                - "SELECT 1"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+        - name: initdb
+          configMap:
+            name: mysql-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dns-firewall-pdb
+  namespace: dns-firewall
+  labels:
+    app: dns-firewall
+    app.kubernetes.io/name: dns-firewall
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: dns-firewall

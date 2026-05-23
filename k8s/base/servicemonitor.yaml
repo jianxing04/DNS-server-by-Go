@@ -1,0 +1,21 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dns-firewall
+  namespace: dns-firewall
+  labels:
+    app: dns-firewall
+    release: prometheus
+    app.kubernetes.io/name: dns-firewall
+spec:
+  selector:
+    matchLabels:
+      app: dns-firewall
+  namespaceSelector:
+    matchNames:
+      - dns-firewall
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

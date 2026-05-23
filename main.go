@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
@@ -47,7 +48,10 @@ func main() {
 	log.Printf("🚀 DNS 防火墙启动 (三级安全引擎已挂载)，监听 %s", cfg.Server.Listen)
 
 	pc := ipv4.NewPacketConn(packetConn)
+	stopReader := make(chan struct{})
+
 	go func() {
+		defer close(stopReader)
 		const batchSize = 64
 		msgs := make([]ipv4.Message, batchSize)
 		for i := range msgs {
@@ -58,6 +62,11 @@ func main() {
 		for {
 			n, err := pc.ReadBatch(msgs, 0)
 			if err != nil {
+				select {
+				case <-stopReader:
+					return
+				default:
+				}
 				continue
 			}
 			for i := range n {
@@ -74,6 +83,8 @@ func main() {
 		}
 	}()
 
+	metrics.SetReady()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -81,7 +92,11 @@ func main() {
 
 	log.Println("🛑 接收到退出信号，正在执行优雅关闭...")
 
+	metrics.SetNotReady()
+	time.Sleep(5 * time.Second)
+
 	conn.Close()
+	<-stopReader
 	database.CloseCache()
 	database.CloseMySQL()
 

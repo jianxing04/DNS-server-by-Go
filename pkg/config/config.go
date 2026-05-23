@@ -147,18 +147,60 @@ func (w WorkerConfig) IdleTimeoutDuration() time.Duration {
 }
 
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("读取配置文件失败 %s: %w", path, err)
-	}
-
 	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("读取配置文件失败 %s: %w", path, err)
+		}
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("解析配置文件失败: %w", err)
+		}
 	}
 
 	applyDefaults(cfg)
+	applyEnvOverrides(cfg)
 	return cfg, nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	if v := os.Getenv("DNS_LISTEN"); v != "" {
+		cfg.Server.Listen = v
+	}
+	if v := os.Getenv("DNS_METRICS_ADDR"); v != "" {
+		cfg.Server.MetricsAddr = v
+	}
+	if v := os.Getenv("DNS_SOCKET_POOL_SIZE"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Server.SocketPoolSize)
+	}
+	if v := os.Getenv("DNS_UPSTREAM_TIMEOUT"); v != "" {
+		cfg.Upstream.Timeout = v
+	}
+	if v := os.Getenv("MYSQL_HOST"); v != "" {
+		cfg.MySQL.Host = v
+	}
+	if v := os.Getenv("MYSQL_PORT"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.MySQL.Port)
+	}
+	if v := os.Getenv("MYSQL_USER"); v != "" {
+		cfg.MySQL.User = v
+	}
+	if v := os.Getenv("MYSQL_PASSWORD"); v != "" {
+		cfg.MySQL.Password = v
+	}
+	if v := os.Getenv("MYSQL_DATABASE"); v != "" {
+		cfg.MySQL.Database = v
+	}
+	if v := os.Getenv("REDIS_ADDR"); v != "" {
+		cfg.Redis.Addr = v
+	}
+	if v := os.Getenv("REDIS_PASSWORD"); v != "" {
+		cfg.Redis.Password = v
+	}
+	if v := os.Getenv("CACHE_SIZE"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Cache.LocalCacheSize)
+	}
 }
 
 func applyDefaults(cfg *Config) {

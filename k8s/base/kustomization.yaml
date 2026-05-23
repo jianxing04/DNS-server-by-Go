@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dns-firewall
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - initdb-configmap.yaml
+  - mysql-statefulset.yaml
+  - mysql-svc.yaml
+  - redis-statefulset.yaml
+  - redis-svc.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - servicemonitor.yaml
+  - network-policy.yaml
+
+images:
+  - name: dns-firewall
+    newTag: latest

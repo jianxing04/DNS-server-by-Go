@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-firewall
+  labels:
+    app.kubernetes.io/name: dns-firewall
+    app.kubernetes.io/part-of: dns-firewall
