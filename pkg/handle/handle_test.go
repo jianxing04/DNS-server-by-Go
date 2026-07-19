@@ -98,11 +98,11 @@ func TestQueryUpstreamWithRacing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("竞速回源失败: %v", err)
 	}
-	if len(respRaw) == 0 {
+	if len(respRaw.raw) == 0 {
 		t.Fatal("返回的数据包为空")
 	}
 
-	t.Logf("✅ 竞速回源测试通过，耗时: %v，返回包大小: %d bytes", duration, len(respRaw))
+	t.Logf("✅ 竞速回源测试通过，耗时: %v，返回包大小: %d bytes", duration, len(respRaw.raw))
 }
 
 // ================= 2. 性能基准测试 (Benchmark) =================

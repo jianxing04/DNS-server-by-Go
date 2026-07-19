@@ -74,11 +74,11 @@ func main() {
 				bufPtr := handle.GetFromPool()
 				copy(*bufPtr, msg.Buffers[0][:msg.N])
 				clientAddr := msg.Addr.(*net.UDPAddr)
-				handle.DispatchRequest(&handle.Request{
-					Data:   *bufPtr,
-					Length: msg.N,
-					Addr:   clientAddr,
-				}, conn)
+				req := handle.GetRequest()
+				req.Data = *bufPtr
+				req.Length = msg.N
+				req.Addr = clientAddr
+				handle.DispatchRequest(req, conn)
 			}
 		}
 	}()

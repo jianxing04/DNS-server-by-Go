@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/coocood/freecache"
 	"github.com/redis/go-redis/v9"
@@ -125,7 +126,12 @@ func CloseCache() {
 // SetCache 封装统一的缓存写入入口，先写入程序缓存，再传递给写队列写入 Redis
 func SetCache(key string, raw []byte, ttl time.Duration) {
 	// 绝对优先：同步写入本地极速缓存，保证热点数据 0 延迟可用
-	LocalCache.Set([]byte(key), raw, int(ttl.Seconds()))
+	// 零拷贝 string→[]byte：freecache 内部会复制 key，此处无需再分配
+	var keyBytes []byte
+	if len(key) > 0 {
+		keyBytes = unsafe.Slice(unsafe.StringData(key), len(key))
+	}
+	LocalCache.Set(keyBytes, raw, int(ttl.Seconds()))
 
 	// 异步降级：投递给 Redis 队列
 	select {

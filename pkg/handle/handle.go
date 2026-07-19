@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,13 @@ var (
 		New: func() any {
 			buf := make([]byte, MaxDNSPacketSize)
 			return &buf
+		},
+	}
+
+	relayPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, MaxDNSPacketSize)
+			return buf
 		},
 	}
 
@@ -95,15 +103,34 @@ func SetUpstreams(servers []string, timeout time.Duration) {
 }
 
 // ================= 并发竞速模型与底层响应 =================
+type upstreamResult struct {
+	raw  []byte
+	aIPs [][4]byte
+}
+
 type racingResult struct {
-	raw []byte
-	err error
+	raw  []byte
+	aIPs [][4]byte
+	err  error
 }
 
 type Request struct {
 	Data   []byte
 	Length int
 	Addr   *net.UDPAddr
+}
+
+var requestPool = sync.Pool{
+	New: func() any { return &Request{} },
+}
+
+func GetRequest() *Request {
+	return requestPool.Get().(*Request)
+}
+
+func PutRequest(req *Request) {
+	*req = Request{}
+	requestPool.Put(req)
 }
 
 func InitWorkerPool(conn *net.UDPConn, cfg config.WorkerConfig) {
@@ -178,6 +205,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		metrics.ObserveDuration(time.Since(startTime).Seconds())
 	}()
 	defer PutToPool(&req.Data)
+	defer PutRequest(req)
 
 	var parser dnsmessage.Parser
 	header, err := parser.Start(req.Data[:req.Length])
@@ -198,7 +226,8 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		}
 	}
 
-	domainLower := strings.ToLower(question.Name.String())
+	nameStr := question.Name.String()
+	domainLower := strings.ToLower(nameStr)
 	database.RecordDomainAccess(domainLower)
 	if _, exists := rules.DomainBlocker[domainLower]; exists {
 		metrics.IncBlocked("Domain")
@@ -206,7 +235,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		return
 	}
 
-	cacheKey := fmt.Sprintf("%s_%d", question.Name.String(), question.Type)
+	cacheKey := nameStr + "_" + strconv.Itoa(int(question.Type))
 	idHigh, idLow := req.Data[0], req.Data[1]
 
 	if cachedRaw, err := database.LocalCache.Get([]byte(cacheKey)); err == nil {
@@ -225,7 +254,28 @@ func processRequest(req *Request, conn *net.UDPConn) {
 	})
 
 	if err == nil {
-		rawResp := result.([]byte)
+		var rawResp []byte
+
+		switch v := result.(type) {
+		case *upstreamResult:
+			rawResp = v.raw
+			for _, ip := range v.aIPs {
+				if rules.TargetIPBlocker.MatchBytes(ip[:]) {
+					metrics.IncBlocked("TargetIP")
+					sendBlockedResponse(conn, req.Addr, header, question)
+					return
+				}
+			}
+		case []byte:
+			rawResp = v
+			if security.IsTargetIPBlocked(rawResp, rules.TargetIPBlocker) {
+				metrics.IncBlocked("TargetIP")
+				sendBlockedResponse(conn, req.Addr, header, question)
+				return
+			}
+		default:
+			return
+		}
 
 		if shared {
 			metrics.IncCacheHit("L1")
@@ -233,31 +283,25 @@ func processRequest(req *Request, conn *net.UDPConn) {
 			metrics.IncCacheHit("Miss")
 		}
 
-		if security.IsTargetIPBlocked(rawResp, rules.TargetIPBlocker) {
-			metrics.IncBlocked("TargetIP")
-			sendBlockedResponse(conn, req.Addr, header, question)
-			return
-		}
-
 		fastRelay(conn, req.Addr, rawResp, idHigh, idLow)
 		if !shared {
-			select {
-			case database.CacheWriteQueue <- database.CacheWriteTask{Key: cacheKey, Raw: rawResp, TTL: 60 * time.Second}:
-			default:
-				// 🔪 【核心优化 3】：静默降级，如果不加这一行，建议你在 database 里把 CacheWriteQueue 长度开到 50000
-			}
+			database.SetCache(cacheKey, rawResp, 60*time.Second)
 		}
 	}
 }
 
-func queryUpstreamWithRacing(reqData []byte) ([]byte, error) {
+func queryUpstreamWithRacing(reqData []byte) (*upstreamResult, error) {
 	deadline := time.Now().Add(upstreamTimeout)
 	resCh := make(chan racingResult, len(upstreamAddrs))
 
 	for _, targetAddr := range upstreamAddrs {
 		go func(target *net.UDPAddr) {
-			raw, err := querySingleUpstream(deadline, target, reqData)
-			resCh <- racingResult{raw, err}
+			res, err := querySingleUpstream(deadline, target, reqData)
+			if err != nil {
+				resCh <- racingResult{err: err}
+				return
+			}
+			resCh <- racingResult{raw: res.raw, aIPs: res.aIPs}
 		}(targetAddr)
 	}
 
@@ -269,7 +313,7 @@ func queryUpstreamWithRacing(reqData []byte) ([]byte, error) {
 		select {
 		case res := <-resCh:
 			if res.err == nil {
-				return res.raw, nil
+				return &upstreamResult{raw: res.raw, aIPs: res.aIPs}, nil
 			}
 			lastErr = res.err
 		case <-timer.C:
@@ -279,7 +323,7 @@ func queryUpstreamWithRacing(reqData []byte) ([]byte, error) {
 	return nil, lastErr
 }
 
-func querySingleUpstream(deadline time.Time, targetAddr *net.UDPAddr, reqData []byte) ([]byte, error) {
+func querySingleUpstream(deadline time.Time, targetAddr *net.UDPAddr, reqData []byte) (*upstreamResult, error) {
 	uConn := getSocket()
 	if uConn == nil {
 		return nil, fmt.Errorf("获取 Socket 失败")
@@ -307,17 +351,37 @@ func querySingleUpstream(deadline time.Time, targetAddr *net.UDPAddr, reqData []
 		return nil, fmt.Errorf("invalid response")
 	}
 
+	// 在验证解析的同时提取 A 记录 IP，避免后续二次解析
+	var aIPs [][4]byte
+	parser.SkipAllQuestions()
+	for {
+		ah, err := parser.AnswerHeader()
+		if err != nil {
+			break
+		}
+		if ah.Type == dnsmessage.TypeA {
+			if res, err := parser.AResource(); err == nil {
+				aIPs = append(aIPs, res.A)
+			}
+		}
+		parser.SkipAnswer()
+	}
+
 	finalResp := make([]byte, n)
 	copy(finalResp, (*respData)[:n])
-	return finalResp, nil
+	return &upstreamResult{raw: finalResp, aIPs: aIPs}, nil
 }
 
 func fastRelay(conn *net.UDPConn, clientAddr *net.UDPAddr, rawResp []byte, idHigh byte, idLow byte) {
-	reply := make([]byte, len(rawResp))
-	copy(reply, rawResp)
+	reply := relayPool.Get().([]byte)
+	if len(reply) < len(rawResp) {
+		reply = make([]byte, len(rawResp))
+	}
+	n := copy(reply, rawResp)
 	reply[0] = idHigh
 	reply[1] = idLow
-	conn.WriteToUDP(reply, clientAddr)
+	conn.WriteToUDP(reply[:n], clientAddr)
+	relayPool.Put(reply)
 }
 
 func sendBlockedResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, reqHeader dnsmessage.Header, question dnsmessage.Question) {

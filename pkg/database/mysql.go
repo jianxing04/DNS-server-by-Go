@@ -152,7 +152,13 @@ func pullRulesFromDB() {
 
 	// 原子替换，零停机更新规则！
 	security.GlobalRules.Store(newRules)
-	log.Printf("🛡️ 成功从 MySQL 同步并加载 %d 条安全规则", count)
+
+	// 规则变更后主动清空 L1 缓存，避免旧缓存绕过新规则
+	if LocalCache != nil {
+		LocalCache.Clear()
+	}
+
+	log.Printf("🛡️ 成功从 MySQL 同步并加载 %d 条安全规则（L1 缓存已清空）", count)
 }
 
 // AsyncStatsFlusher 每隔 10 秒收集一次内存增量，并写入数据库
