@@ -10,7 +10,7 @@ import (
 
 func TestRecordDomainAccess_Concurrency(t *testing.T) {
 	// 每次测试前清空 Map，防止干扰
-	DomainStatsMap = sync.Map{}
+	DomainStatsMap.Reset()
 
 	const goroutines = 1000 // 模拟 1000 个并发请求同时涌入
 	const increments = 100  // 每个协程访问同一个域名 100 次
@@ -37,7 +37,7 @@ func TestRecordDomainAccess_Concurrency(t *testing.T) {
 		t.Fatalf("❌ 域名 %s 没有被记录进 Map", targetDomain)
 	}
 
-	finalCount := atomic.LoadInt64(val.(*int64))
+	finalCount := atomic.LoadInt64(val)
 	expectedCount := int64(goroutines * increments)
 
 	if finalCount != expectedCount {
@@ -49,7 +49,7 @@ func TestRecordDomainAccess_Concurrency(t *testing.T) {
 
 func TestAsyncStatsFlusher_AtomicSwap(t *testing.T) {
 	// 验证在提取数据的瞬间，原子替换是否正确运作
-	DomainStatsMap = sync.Map{}
+	DomainStatsMap.Reset()
 	testDomain := "example.com."
 
 	// 模拟写入 50 次
@@ -59,7 +59,7 @@ func TestAsyncStatsFlusher_AtomicSwap(t *testing.T) {
 
 	// 模拟 Flusher 提取数据的核心逻辑
 	val, _ := DomainStatsMap.Load(testDomain)
-	countPtr := val.(*int64)
+	countPtr := val
 
 	// 提取并瞬间归零
 	delta := atomic.SwapInt64(countPtr, 0)
@@ -80,7 +80,7 @@ func TestAsyncStatsFlusher_AtomicSwap(t *testing.T) {
 // ================= 2. 性能基准测试：压榨你的计数器性能极限 =================
 
 func BenchmarkRecordDomainAccess_SameKey(b *testing.B) {
-	DomainStatsMap = sync.Map{}
+	DomainStatsMap.Reset()
 	domain := "hot-domain.com."
 
 	// 先初始化一次，为了测纯粹的原子累加性能
@@ -97,7 +97,7 @@ func BenchmarkRecordDomainAccess_SameKey(b *testing.B) {
 }
 
 func BenchmarkRecordDomainAccess_RandomKeys(b *testing.B) {
-	DomainStatsMap = sync.Map{}
+	DomainStatsMap.Reset()
 
 	// 准备一组字典，模拟正常用户的真实访问分布
 	domains := []string{

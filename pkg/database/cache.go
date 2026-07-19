@@ -14,8 +14,96 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const domainStatsShardCount = 64
+
+type domainStatsShard struct {
+	mu   sync.Mutex
+	data map[string]*int64
+}
+
+// ShardedDomainStats 按域名哈希分散到多个独立锁保护的 map 桶中，
+// 替代 sync.Map 以降低高并发写入竞争。
+type ShardedDomainStats struct {
+	shards [domainStatsShardCount]domainStatsShard
+}
+
+func NewShardedDomainStats() *ShardedDomainStats {
+	return &ShardedDomainStats{}
+}
+
+func (s *ShardedDomainStats) shardIndex(domain string) uint32 {
+	// FNV-1a hash，无堆分配
+	h := uint32(2166136261)
+	for i := 0; i < len(domain); i++ {
+		h ^= uint32(domain[i])
+		h *= 16777619
+	}
+	return h % domainStatsShardCount
+}
+
+func (s *ShardedDomainStats) Record(domain string) {
+	idx := s.shardIndex(domain)
+	shard := &s.shards[idx]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if shard.data == nil {
+		shard.data = make(map[string]*int64)
+	}
+
+	if ptr := shard.data[domain]; ptr != nil {
+		atomic.AddInt64(ptr, 1)
+	} else {
+		var count int64 = 1
+		shard.data[domain] = &count
+	}
+}
+
+func (s *ShardedDomainStats) Load(domain string) (*int64, bool) {
+	idx := s.shardIndex(domain)
+	shard := &s.shards[idx]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if shard.data == nil {
+		return nil, false
+	}
+	ptr, ok := shard.data[domain]
+	return ptr, ok
+}
+
+func (s *ShardedDomainStats) Range(fn func(domain string, countPtr *int64) bool) {
+	for i := range s.shards {
+		shard := &s.shards[i]
+		shard.mu.Lock()
+		for domain, ptr := range shard.data {
+			if !fn(domain, ptr) {
+				shard.mu.Unlock()
+				return
+			}
+		}
+		shard.mu.Unlock()
+	}
+}
+
+func (s *ShardedDomainStats) Delete(domain string) {
+	idx := s.shardIndex(domain)
+	shard := &s.shards[idx]
+	shard.mu.Lock()
+	delete(shard.data, domain)
+	shard.mu.Unlock()
+}
+
+func (s *ShardedDomainStats) Reset() {
+	for i := range s.shards {
+		shard := &s.shards[i]
+		shard.mu.Lock()
+		shard.data = make(map[string]*int64)
+		shard.mu.Unlock()
+	}
+}
+
 var (
-	DomainStatsMap  sync.Map
+	DomainStatsMap  = NewShardedDomainStats()
 	CacheWriteQueue chan CacheWriteTask
 	LocalCache      *freecache.Cache
 
@@ -144,14 +232,7 @@ func SetCache(key string, raw []byte, ttl time.Duration) {
 
 // RecordDomainAccess 在程序内存记录域名访问次数
 func RecordDomainAccess(domain string) {
-	if v, ok := DomainStatsMap.Load(domain); ok {
-		atomic.AddInt64(v.(*int64), 1)
-		return
-	}
-	var initCount int64 = 1
-	if actual, loaded := DomainStatsMap.LoadOrStore(domain, &initCount); loaded {
-		atomic.AddInt64(actual.(*int64), 1)
-	}
+	DomainStatsMap.Record(domain)
 }
 
 // GetRedis 获取 Redis 数据

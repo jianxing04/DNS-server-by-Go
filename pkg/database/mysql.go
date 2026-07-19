@@ -184,16 +184,13 @@ func AsyncStatsFlusher() {
 func doFlush() {
 	snapshot := make(map[string]int64)
 
-	DomainStatsMap.Range(func(key, value any) bool {
-		domain := key.(string)
-		countPtr := value.(*int64)
-
+	DomainStatsMap.Range(func(domain string, countPtr *int64) bool {
 		delta := atomic.SwapInt64(countPtr, 0)
 		if delta > 0 {
 			snapshot[domain] = delta
 		} else {
 			// 防爆内存：如果一段时间内无人访问该域名，直接从 Map 删除
-			DomainStatsMap.Delete(key)
+			DomainStatsMap.Delete(domain)
 		}
 		return true
 	})

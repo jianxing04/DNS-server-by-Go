@@ -71,13 +71,15 @@ func main() {
 			}
 			for i := range n {
 				msg := &msgs[i]
+				// 零拷贝：直接复用 ReadBatch 填好的 buffer，再换一个新的给 ReadBatch
 				bufPtr := handle.GetFromPool()
-				copy(*bufPtr, msg.Buffers[0][:msg.N])
-				clientAddr := msg.Addr.(*net.UDPAddr)
+				reqData := msg.Buffers[0]
+				msg.Buffers = [][]byte{*bufPtr}
+
 				req := handle.GetRequest()
-				req.Data = *bufPtr
+				req.Data = reqData
 				req.Length = msg.N
-				req.Addr = clientAddr
+				req.Addr = msg.Addr.(*net.UDPAddr)
 				handle.DispatchRequest(req, conn)
 			}
 		}

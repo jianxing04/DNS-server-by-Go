@@ -8,8 +8,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,12 +39,25 @@ var (
 		},
 	}
 
+	responseBufPool = sync.Pool{
+		New: func() any {
+			return make([]byte, MaxDNSPacketSize)
+		},
+	}
+
 	socketPool     chan *net.UDPConn
 	socketPoolSize int
 
-	upstreamAddrs   []*net.UDPAddr
-	upstreamTimeout time.Duration
-	requestGroup    singleflight.Group
+	upstreamAddrs      []*net.UDPAddr
+	upstreamTimeout    time.Duration
+	requestGroup       singleflight.Group
+	racingResultChPool = sync.Pool{
+		New: func() any {
+			ch := make(chan racingResult, 64)
+			return &ch
+		},
+	}
+	racingQueryID atomic.Uint64
 )
 
 func InitSocketPool(size int) {
@@ -104,14 +115,23 @@ func SetUpstreams(servers []string, timeout time.Duration) {
 
 // ================= 并发竞速模型与底层响应 =================
 type upstreamResult struct {
-	raw  []byte
-	aIPs [][4]byte
+	raw     []byte
+	aIPs    [][4]byte
+	ownsRaw bool
+}
+
+func (r *upstreamResult) Release() {
+	if r != nil && r.ownsRaw && r.raw != nil {
+		responseBufPool.Put(r.raw[:cap(r.raw)])
+		r.raw = nil
+	}
 }
 
 type racingResult struct {
-	raw  []byte
-	aIPs [][4]byte
-	err  error
+	queryID uint64
+	raw     []byte
+	aIPs    [][4]byte
+	err     error
 }
 
 type Request struct {
@@ -142,7 +162,11 @@ func InitWorkerPool(conn *net.UDPConn, cfg config.WorkerConfig) {
 }
 
 func GetFromPool() *[]byte {
-	return bufferPool.Get().(*[]byte)
+	bufPtr := bufferPool.Get().(*[]byte)
+	if len(*bufPtr) < MaxDNSPacketSize {
+		*bufPtr = make([]byte, MaxDNSPacketSize)
+	}
+	return bufPtr
 }
 
 func PutToPool(buf *[]byte) {
@@ -197,6 +221,48 @@ func spawnWorker(conn *net.UDPConn) {
 	}()
 }
 
+const maxDNSNameLen = 255
+
+func toLowerASCII(b []byte) {
+	for i := range b {
+		c := b[i]
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+}
+
+func writeUint16(b []byte, v uint16) int {
+	if v == 0 {
+		b[0] = '0'
+		return 1
+	}
+	var tmp [5]byte
+	n := len(tmp)
+	for v > 0 {
+		n--
+		tmp[n] = byte('0' + v%10)
+		v /= 10
+	}
+	return copy(b, tmp[n:])
+}
+
+// encodeCacheKey 将 DNS 域名转为小写，并拼接 "_<type>" 作为缓存 key。
+// keyBuf 需要至少 nameLen+6 字节；返回小写域名字符串（用于 map 查找）和缓存 key 长度。
+func encodeCacheKey(name dnsmessage.Name, qType dnsmessage.Type, keyBuf []byte) (domainLower string, keyLen int) {
+	nameLen := int(name.Length)
+	copy(keyBuf, name.Data[:nameLen])
+	lowerBytes := keyBuf[:nameLen]
+	toLowerASCII(lowerBytes)
+
+	domainLower = string(lowerBytes)
+
+	keyBuf[nameLen] = '_'
+	keyLen = nameLen + 1
+	keyLen += writeUint16(keyBuf[keyLen:], uint16(qType))
+	return
+}
+
 // ================= 核心处理：三道防线与中继 =================
 func processRequest(req *Request, conn *net.UDPConn) {
 	metrics.IncQuery()
@@ -226,19 +292,20 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		}
 	}
 
-	nameStr := question.Name.String()
-	domainLower := strings.ToLower(nameStr)
+	var keyBuf [maxDNSNameLen + 6]byte
+	domainLower, cacheKeyLen := encodeCacheKey(question.Name, question.Type, keyBuf[:])
 	database.RecordDomainAccess(domainLower)
 	if _, exists := rules.DomainBlocker[domainLower]; exists {
 		metrics.IncBlocked("Domain")
-		sendBlockedResponse(conn, req.Addr, header, question)
+		sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
 		return
 	}
 
-	cacheKey := nameStr + "_" + strconv.Itoa(int(question.Type))
+	cacheKeyBytes := keyBuf[:cacheKeyLen]
+	cacheKey := string(cacheKeyBytes)
 	idHigh, idLow := req.Data[0], req.Data[1]
 
-	if cachedRaw, err := database.LocalCache.Get([]byte(cacheKey)); err == nil {
+	if cachedRaw, err := database.LocalCache.Get(cacheKeyBytes); err == nil {
 		metrics.IncCacheHit("L1")
 		fastRelay(conn, req.Addr, cachedRaw, idHigh, idLow)
 		return
@@ -259,10 +326,13 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		switch v := result.(type) {
 		case *upstreamResult:
 			rawResp = v.raw
+			if v.ownsRaw && !shared {
+				defer v.Release()
+			}
 			for _, ip := range v.aIPs {
 				if rules.TargetIPBlocker.MatchBytes(ip[:]) {
 					metrics.IncBlocked("TargetIP")
-					sendBlockedResponse(conn, req.Addr, header, question)
+					sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
 					return
 				}
 			}
@@ -270,7 +340,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 			rawResp = v
 			if security.IsTargetIPBlocked(rawResp, rules.TargetIPBlocker) {
 				metrics.IncBlocked("TargetIP")
-				sendBlockedResponse(conn, req.Addr, header, question)
+				sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
 				return
 			}
 		default:
@@ -290,18 +360,46 @@ func processRequest(req *Request, conn *net.UDPConn) {
 	}
 }
 
+func getRacingResultCh() chan racingResult {
+	chPtr := racingResultChPool.Get().(*chan racingResult)
+	var ch chan racingResult
+	if chPtr == nil {
+		ch = make(chan racingResult, 64)
+	} else {
+		ch = *chPtr
+		for len(ch) > 0 {
+			<-ch
+		}
+	}
+	return ch
+}
+
+func putRacingResultCh(ch chan racingResult) {
+	for len(ch) > 0 {
+		<-ch
+	}
+	racingResultChPool.Put(&ch)
+}
+
 func queryUpstreamWithRacing(reqData []byte) (*upstreamResult, error) {
+	qid := racingQueryID.Add(1)
 	deadline := time.Now().Add(upstreamTimeout)
-	resCh := make(chan racingResult, len(upstreamAddrs))
+	resCh := getRacingResultCh()
+	ctx, cancel := context.WithCancel(context.Background())
 
 	for _, targetAddr := range upstreamAddrs {
 		go func(target *net.UDPAddr) {
 			res, err := querySingleUpstream(deadline, target, reqData)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			if err != nil {
-				resCh <- racingResult{err: err}
+				resCh <- racingResult{queryID: qid, err: err}
 				return
 			}
-			resCh <- racingResult{raw: res.raw, aIPs: res.aIPs}
+			resCh <- racingResult{queryID: qid, raw: res.raw, aIPs: res.aIPs}
 		}(targetAddr)
 	}
 
@@ -312,14 +410,24 @@ func queryUpstreamWithRacing(reqData []byte) (*upstreamResult, error) {
 	for i := 0; i < len(upstreamAddrs); i++ {
 		select {
 		case res := <-resCh:
+			if res.queryID != qid {
+				i--
+				continue
+			}
 			if res.err == nil {
+				cancel()
+				putRacingResultCh(resCh)
 				return &upstreamResult{raw: res.raw, aIPs: res.aIPs}, nil
 			}
 			lastErr = res.err
 		case <-timer.C:
+			cancel()
+			putRacingResultCh(resCh)
 			return nil, fmt.Errorf("upstream timeout")
 		}
 	}
+	cancel()
+	putRacingResultCh(resCh)
 	return nil, lastErr
 }
 
@@ -367,9 +475,12 @@ func querySingleUpstream(deadline time.Time, targetAddr *net.UDPAddr, reqData []
 		parser.SkipAnswer()
 	}
 
-	finalResp := make([]byte, n)
-	copy(finalResp, (*respData)[:n])
-	return &upstreamResult{raw: finalResp, aIPs: aIPs}, nil
+	finalBuf := responseBufPool.Get().([]byte)
+	if len(finalBuf) < n {
+		finalBuf = make([]byte, n)
+	}
+	copy(finalBuf, (*respData)[:n])
+	return &upstreamResult{raw: finalBuf[:n], aIPs: aIPs, ownsRaw: true}, nil
 }
 
 func fastRelay(conn *net.UDPConn, clientAddr *net.UDPAddr, rawResp []byte, idHigh byte, idLow byte) {
@@ -384,14 +495,68 @@ func fastRelay(conn *net.UDPConn, clientAddr *net.UDPAddr, rawResp []byte, idHig
 	relayPool.Put(reply)
 }
 
-func sendBlockedResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, reqHeader dnsmessage.Header, question dnsmessage.Question) {
-	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID: reqHeader.ID, Response: true, OpCode: reqHeader.OpCode, RCode: dnsmessage.RCodeSuccess,
-	})
-	builder.StartQuestions()
-	builder.Question(question)
-	builder.StartAnswers()
-	builder.AResource(dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60}, dnsmessage.AResource{A: [4]byte{0, 0, 0, 0}})
-	respBytes, _ := builder.Finish()
-	conn.WriteToUDP(respBytes, clientAddr)
+var blockedRespPool = sync.Pool{
+	New: func() any {
+		return make([]byte, MaxDNSPacketSize)
+	},
+}
+
+// blockedRespHeaderTemplate 预构建的 DNS 响应头模板（12 字节）。
+// 仅 ID 与 OpCode 需要在发送时按请求覆盖。
+var blockedRespHeaderTemplate = [12]byte{
+	0x00, 0x00, // ID
+	0x80, 0x00, // Response=1, OpCode=0, RCode=0
+	0x00, 0x01, // QDCOUNT=1
+	0x00, 0x01, // ANCOUNT=1
+	0x00, 0x00, // NSCOUNT=0
+	0x00, 0x00, // ARCOUNT=0
+}
+
+// blockedRespAnswerTemplate 预构建的 A 记录 0.0.0.0 答案模板（16 字节），
+// 使用压缩指针 0xC00C 指向请求中的 question name。
+var blockedRespAnswerTemplate = [16]byte{
+	0xc0, 0x0c, // Pointer to question name at offset 12
+	0x00, 0x01, // Type A
+	0x00, 0x01, // Class IN
+	0x00, 0x00, 0x00, 0x3c, // TTL 60
+	0x00, 0x04, // RDLENGTH=4
+	0x00, 0x00, 0x00, 0x00, // 0.0.0.0
+}
+
+func sendBlockedResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, reqData []byte, reqHeader dnsmessage.Header) {
+	if conn == nil || len(reqData) < 12 {
+		return
+	}
+	resp := blockedRespPool.Get().([]byte)
+	if len(resp) < MaxDNSPacketSize {
+		resp = make([]byte, MaxDNSPacketSize)
+	}
+
+	copy(resp, blockedRespHeaderTemplate[:])
+	resp[0] = reqData[0]
+	resp[1] = reqData[1]
+	resp[2] = 0x80 | byte(reqHeader.OpCode<<3)
+
+	// 找到 question name 的结束位置（0x00），question 区段总长为 nameLen+5（含 QTYPE/QCLASS）
+	qEnd := 12
+	for qEnd < len(reqData) && reqData[qEnd] != 0 {
+		qEnd++
+	}
+	qEnd += 5
+	if qEnd > len(reqData) || qEnd > MaxDNSPacketSize {
+		blockedRespPool.Put(resp[:cap(resp)])
+		return
+	}
+
+	copy(resp[12:], reqData[12:qEnd])
+
+	off := 12 + (qEnd - 12)
+	if off+16 > MaxDNSPacketSize {
+		blockedRespPool.Put(resp[:cap(resp)])
+		return
+	}
+	copy(resp[off:], blockedRespAnswerTemplate[:])
+
+	conn.WriteToUDP(resp[:off+16], clientAddr)
+	blockedRespPool.Put(resp[:cap(resp)])
 }
