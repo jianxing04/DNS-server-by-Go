@@ -291,7 +291,6 @@ func processRequest(req *Request, conn *net.UDPConn) {
 
 	var keyBuf [maxDNSNameLen + 6]byte
 	domainLower, cacheKeyLen := encodeCacheKey(question.Name, question.Type, keyBuf[:])
-	database.RecordDomainAccess(domainLower)
 	if _, exists := rules.DomainBlocker[domainLower]; exists {
 		metrics.IncBlockedDomain()
 		sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
@@ -304,7 +303,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 	// ===== L1 快速路径：跳过 time.Now() 与 duration 指标 =====
 	if cachedRaw, err := database.LocalCache.Get(cacheKeyBytes); err == nil {
 		metrics.IncCacheHitL1()
-		fastRelay(conn, req.Addr, cachedRaw, idHigh, idLow)
+		fastRelay(conn, req.Addr, cachedRaw, idHigh, idLow, true)
 		return
 	}
 
@@ -356,7 +355,8 @@ func processRequest(req *Request, conn *net.UDPConn) {
 			metrics.IncCacheHitMiss()
 		}
 
-		fastRelay(conn, req.Addr, rawResp, idHigh, idLow)
+		database.RecordDomainAccess(domainLower)
+		fastRelay(conn, req.Addr, rawResp, idHigh, idLow, false)
 		if !shared {
 			database.SetCache(cacheKey, rawResp, 60*time.Second)
 		}
@@ -488,7 +488,13 @@ func querySingleUpstream(deadline time.Time, targetAddr *net.UDPAddr, reqData []
 	return &upstreamResult{raw: finalBuf[:n], aIPs: aIPs, ownsRaw: true}, nil
 }
 
-func fastRelay(conn *net.UDPConn, clientAddr *net.UDPAddr, rawResp []byte, idHigh byte, idLow byte) {
+func fastRelay(conn *net.UDPConn, clientAddr *net.UDPAddr, rawResp []byte, idHigh byte, idLow byte, owned bool) {
+	if owned {
+		rawResp[0] = idHigh
+		rawResp[1] = idLow
+		conn.WriteToUDP(rawResp, clientAddr)
+		return
+	}
 	reply := relayPool.Get().([]byte)
 	if len(reply) < len(rawResp) {
 		reply = make([]byte, len(rawResp))
