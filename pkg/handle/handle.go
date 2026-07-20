@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sync/singleflight"
@@ -183,7 +184,7 @@ func DispatchRequest(req *Request, conn *net.UDPConn) {
 		select {
 		case jobQueue <- req:
 		default:
-			metrics.IncBlocked("Overload")
+			metrics.IncBlockedOverload()
 			PutToPool(&req.Data)
 		}
 	}
@@ -266,10 +267,6 @@ func encodeCacheKey(name dnsmessage.Name, qType dnsmessage.Type, keyBuf []byte) 
 // ================= 核心处理：三道防线与中继 =================
 func processRequest(req *Request, conn *net.UDPConn) {
 	metrics.IncQuery()
-	startTime := time.Now()
-	defer func() {
-		metrics.ObserveDuration(time.Since(startTime).Seconds())
-	}()
 	defer PutToPool(&req.Data)
 	defer PutRequest(req)
 
@@ -287,7 +284,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 
 	if clientIP4 := req.Addr.IP.To4(); clientIP4 != nil {
 		if rules.ClientIPBlocker.MatchBytes(clientIP4) {
-			metrics.IncBlocked("ClientIP")
+			metrics.IncBlockedClient()
 			return
 		}
 	}
@@ -296,20 +293,26 @@ func processRequest(req *Request, conn *net.UDPConn) {
 	domainLower, cacheKeyLen := encodeCacheKey(question.Name, question.Type, keyBuf[:])
 	database.RecordDomainAccess(domainLower)
 	if _, exists := rules.DomainBlocker[domainLower]; exists {
-		metrics.IncBlocked("Domain")
+		metrics.IncBlockedDomain()
 		sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
 		return
 	}
 
 	cacheKeyBytes := keyBuf[:cacheKeyLen]
-	cacheKey := string(cacheKeyBytes)
 	idHigh, idLow := req.Data[0], req.Data[1]
 
+	// ===== L1 快速路径：跳过 time.Now() 与 duration 指标 =====
 	if cachedRaw, err := database.LocalCache.Get(cacheKeyBytes); err == nil {
-		metrics.IncCacheHit("L1")
+		metrics.IncCacheHitL1()
 		fastRelay(conn, req.Addr, cachedRaw, idHigh, idLow)
 		return
 	}
+
+	// ===== 慢路径：启动计时 =====
+	startTime := time.Now()
+
+	// 零拷贝构建 cacheKey string：keyBuf 为栈上数组，在 singleflight 返回前不会被覆盖
+	cacheKey := unsafe.String(unsafe.SliceData(cacheKeyBytes), cacheKeyLen)
 
 	result, err, shared := requestGroup.Do(cacheKey, func() (any, error) {
 		ctxRedis, cancelRedis := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -331,7 +334,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 			}
 			for _, ip := range v.aIPs {
 				if rules.TargetIPBlocker.MatchBytes(ip[:]) {
-					metrics.IncBlocked("TargetIP")
+					metrics.IncBlockedTarget()
 					sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
 					return
 				}
@@ -339,7 +342,7 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		case []byte:
 			rawResp = v
 			if security.IsTargetIPBlocked(rawResp, rules.TargetIPBlocker) {
-				metrics.IncBlocked("TargetIP")
+				metrics.IncBlockedTarget()
 				sendBlockedResponse(conn, req.Addr, req.Data[:req.Length], header)
 				return
 			}
@@ -348,9 +351,9 @@ func processRequest(req *Request, conn *net.UDPConn) {
 		}
 
 		if shared {
-			metrics.IncCacheHit("L1")
+			metrics.IncCacheHitL1()
 		} else {
-			metrics.IncCacheHit("Miss")
+			metrics.IncCacheHitMiss()
 		}
 
 		fastRelay(conn, req.Addr, rawResp, idHigh, idLow)
@@ -358,6 +361,8 @@ func processRequest(req *Request, conn *net.UDPConn) {
 			database.SetCache(cacheKey, rawResp, 60*time.Second)
 		}
 	}
+
+	metrics.ObserveDuration(time.Since(startTime).Seconds())
 }
 
 func getRacingResultCh() chan racingResult {

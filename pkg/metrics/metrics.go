@@ -12,7 +12,7 @@ import (
 
 var ready int32
 
-func SetReady()  { atomic.StoreInt32(&ready, 1) }
+func SetReady()    { atomic.StoreInt32(&ready, 1) }
 func SetNotReady() { atomic.StoreInt32(&ready, 0) }
 
 var (
@@ -38,9 +38,23 @@ var (
 	})
 )
 
-func IncQuery()                { totalQueries.Inc() }
-func IncCacheHit(layer string) { cacheHits.WithLabelValues(layer).Inc() }
-func IncBlocked(reason string) { blockedQueries.WithLabelValues(reason).Inc() }
+// 预取所有 label 组合的 Counter 实例，避免热路径上 WithLabelValues 的 map 查找开销
+var (
+	cacheHitL1    = cacheHits.WithLabelValues("L1")
+	cacheHitMiss  = cacheHits.WithLabelValues("Miss")
+	blockClientIP = blockedQueries.WithLabelValues("ClientIP")
+	blockDomain   = blockedQueries.WithLabelValues("Domain")
+	blockTargetIP = blockedQueries.WithLabelValues("TargetIP")
+	blockOverload = blockedQueries.WithLabelValues("Overload")
+)
+
+func IncQuery()                 { totalQueries.Inc() }
+func IncCacheHitL1()            { cacheHitL1.Inc() }
+func IncCacheHitMiss()          { cacheHitMiss.Inc() }
+func IncBlockedClient()         { blockClientIP.Inc() }
+func IncBlockedDomain()         { blockDomain.Inc() }
+func IncBlockedTarget()         { blockTargetIP.Inc() }
+func IncBlockedOverload()       { blockOverload.Inc() }
 func ObserveDuration(s float64) { requestDuration.Observe(s) }
 
 func StartServer(addr string) {
